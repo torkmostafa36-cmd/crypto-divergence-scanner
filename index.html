@@ -1,0 +1,188 @@
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crypto Divergence Scanner</title>
+<style>
+body{background:#101827;color:#eee;font-family:Arial;padding:15px}
+h2{color:#43d9a3;text-align:center}
+button,select{padding:12px;border:0;border-radius:8px;margin:5px;background:#263750;color:white}
+button{background:#087e65;font-weight:bold}
+#status{padding:12px;color:#ffd36b}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:10px;border-bottom:1px solid #344258;text-align:center}
+.bull{color:#42e6a4}.bear{color:#ff7474}
+a{color:#68baff}
+</style>
+</head>
+<body>
+<h2>اسکنر واگرایی RSI</h2>
+<p style="text-align:center">Toobit Futures | 1H | RSI 14</p>
+
+<button onclick="startScan()">شروع اسکن بازار</button>
+<button onclick="location.reload()">تازه سازی</button>
+
+<div id="status">آماده اسکن</div>
+
+<table>
+<thead>
+<tr>
+<th>ارز</th>
+<th>نوع واگرایی</th>
+<th>قیمت</th>
+<th>RSI</th>
+<th>زمان پیوت</th>
+</tr>
+</thead>
+<tbody id="results"></tbody>
+</table>
+
+<script>
+const API="https://api.toobit.com";
+const INTERVAL=3600000;
+let found=[];
+
+function rsiCalc(closes){
+ let r=Array(closes.length).fill(null);
+ let gains=0,losses=0;
+ if(closes.length<16)return r;
+
+ for(let i=1;i<=14;i++){
+  let d=closes[i]-closes[i-1];
+  if(d>0)gains+=d;else losses-=d;
+ }
+ let ag=gains/14,al=losses/14;
+ r[14]=al===0?100:100-100/(1+ag/al);
+
+ for(let i=15;i<closes.length;i++){
+  let d=closes[i]-closes[i-1];
+  ag=(ag*13+Math.max(d,0))/14;
+  al=(al*13+Math.max(-d,0))/14;
+  r[i]=al===0?100:100-100/(1+ag/al);
+ }
+ return r;
+}
+
+function pivots(data,type){
+ let out=[];
+ const L=3,R=3;
+ for(let i=L;i<data.length-R;i++){
+  let ok=true;
+  for(let j=i-L;j<=i+R;j++){
+   if(j===i)continue;
+   if(type==="low" && data[j]<=data[i])ok=false;
+   if(type==="high" && data[j]>=data[i])ok=false;
+  }
+  if(ok)out.push(i);
+ }
+ return out;
+}
+
+function analyze(candles,symbol){
+ const now=Date.now();
+ candles=candles.filter(c=>Number(c[0])+INTERVAL<=now);
+ if(candles.length<40)return [];
+
+ const close=candles.map(c=>+c[4]);
+ const low=candles.map(c=>+c[3]);
+ const high=candles.map(c=>+c[2]);
+ const rsi=rsiCalc(close);
+ let out=[];
+
+ function check(type){
+  let ps=pivots(type==="low"?low:high,type);
+  ps=ps.filter(i=>rsi[i]!==null);
+  if(ps.length<2)return;
+  let a=ps[ps.length-2],b=ps[ps.length-1];
+  if(b-a>60)return;
+
+  let p1=type==="low"?low[a]:high[a];
+  let p2=type==="low"?low[b]:high[b];
+  let r1=rsi[a],r2=rsi[b];
+  let name="";
+
+  if(type==="low"){
+   if(p2<p1 && r2>r1)name="واگرایی معمولی صعودی";
+   if(p2>p1 && r2<r1)name="واگرایی مخفی صعودی";
+  }else{
+   if(p2>p1 && r2<r1)name="واگرایی معمولی نزولی";
+   if(p2<p1 && r2>r1)name="واگرایی مخفی نزولی";
+  }
+
+  if(name)out.push({
+   symbol,name,price:close.at(-1),
+   rsi:r2,time:candles[b][0]
+  });
+ }
+ check("low");
+ check("high");
+ return out;
+}
+
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+async function startScan(){
+ const status=document.getElementById("status");
+ const body=document.getElementById("results");
+ body.innerHTML="";
+ found=[];
+ try{
+  status.textContent="در حال دریافت فهرست قراردادها...";
+  const info=await fetch(API+"/api/v1/exchangeInfo").then(r=>{
+   if(!r.ok)throw Error("خطای دریافت اطلاعات بازار");
+   return r.json();
+  });
+  const symbols=(info.contracts||[]).filter(x=>
+   x.status==="TRADING" &&
+   x.symbol.endsWith("-SWAP-USDT")
+  );
+  if(!symbols.length)throw Error("قرارداد فعالی پیدا نشد");
+
+  let done=0;
+  let queue=[...symbols];
+  let workers=Array.from({length:3},async()=>{
+   while(queue.length){
+    const s=queue.shift();
+    try{
+     const url=API+"/quote/v1/klines?symbol="+
+      encodeURIComponent(s.symbol)+
+      "&interval=1h&limit=100";
+     const res=await fetch(url);
+     if(!res.ok)throw Error("Kline error");
+     const data=await res.json();
+     if(Array.isArray(data)){
+      found.push(...analyze(data,s.symbol));
+     }
+    }catch(e){}
+    done++;
+    status.textContent="بررسی "+done+" از "+symbols.length+
+     " قرارداد | واگرایی: "+found.length;
+    await sleep(250);
+   }
+  });
+  await Promise.all(workers);
+
+  found.sort((a,b)=>b.time-a.time);
+  body.innerHTML=found.map(x=>{
+   const bull=x.name.includes("صعودی");
+   return `<tr>
+   <td>${x.symbol}</td>
+   <td class="${bull?'bull':'bear'}">${x.name}</td>
+   <td>${Number(x.price).toPrecision(7)}</td>
+   <td>${x.rsi.toFixed(2)}</td>
+   <td>${new Date(x.time).toLocaleString('fa-IR')}</td>
+   </tr>`;
+  }).join("");
+
+  status.textContent="پایان اسکن | "+done+
+   " قرارداد بررسی شد | "+found.length+" واگرایی پیدا شد";
+ }catch(e){
+  status.textContent="خطا: "+e.message+
+   " | ممکن است اتصال API یا دسترسی مرورگر مشکل داشته باشد.";
+ }
+}
+</script>
+</body>
+</html>
